@@ -23,9 +23,6 @@ from models import (
     AutoFixRequest, GateRequest, GateResponse,
     GraphBlueprint, HITLDecision, RunEvent,
 )
-import sys as _sys
-import os as _os
-_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
 from arize.instrumentation import session_tracer
 from auto_fix import generate_fix
 from claude_tool_executor import execute_with_claude

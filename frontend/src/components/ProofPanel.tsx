@@ -52,15 +52,18 @@ function StatCard({
 }
 
 import type { AuditEvent } from "../types";
+import type { AsiAgent } from "./AsiDiscovery";
+import { Globe, Star } from "lucide-react";
 
 interface Props {
   data: ProofData;
   sessionId: string;
   onExport: () => void;
   auditEvents?: AuditEvent[];
+  asiAgents?: AsiAgent[];
 }
 
-export function ProofPanel({ data, onExport, auditEvents = [] }: Props) {
+export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [] }: Props) {
   const variance =
     ((data.topology_a.actual_cost_usd - data.predicted_cost_usd) /
       data.predicted_cost_usd) *
@@ -309,6 +312,69 @@ export function ProofPanel({ data, onExport, auditEvents = [] }: Props) {
             </div>
           </div>
         </div>
+
+        {/* ASI:One / AgentVerse comparison */}
+        {asiAgents.length > 0 && (
+          <div className="mt-6 bg-white border-2 border-blue-200 rounded-2xl overflow-hidden shadow-sm">
+            <div className="bg-blue-50 border-b border-blue-200 px-5 py-3 flex items-center gap-2">
+              <Globe size={15} className="text-blue-600" />
+              <span className="text-sm font-bold text-blue-900">SafeAgent vs AgentVerse — Evidence Comparison</span>
+            </div>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-blue-100 bg-blue-50/40">
+                  <th className="text-left px-5 py-2 text-xs text-blue-500 uppercase tracking-wide font-semibold">Agent</th>
+                  <th className="text-center px-4 py-2 text-xs text-blue-500 uppercase tracking-wide font-semibold">Source</th>
+                  <th className="text-center px-4 py-2 text-xs text-blue-500 uppercase tracking-wide font-semibold">Interactions</th>
+                  <th className="text-center px-4 py-2 text-xs text-blue-500 uppercase tracking-wide font-semibold">Rating</th>
+                  <th className="text-center px-4 py-2 text-xs text-blue-500 uppercase tracking-wide font-semibold">Misalignment</th>
+                  <th className="text-center px-4 py-2 text-xs text-blue-500 uppercase tracking-wide font-semibold">Verdict</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-blue-50">
+                {/* SafeAgent's run */}
+                <tr className="bg-emerald-50/40">
+                  <td className="px-5 py-3 font-semibold text-emerald-900 text-xs">SafeAgent (this run)</td>
+                  <td className="px-4 py-3 text-center"><span className="text-[10px] bg-emerald-100 text-emerald-700 border border-emerald-200 px-2 py-0.5 rounded-full font-bold">SafeAgent</span></td>
+                  <td className="px-4 py-3 text-center text-xs font-mono text-emerald-800">—</td>
+                  <td className="px-4 py-3 text-center text-xs font-mono text-emerald-800">—</td>
+                  <td className="px-4 py-3 text-center">
+                    <span className={`text-sm font-bold font-mono ${data.topology_a.per_agent.some(a => (a.safety_score ?? 0) > 50) ? "text-red-500" : "text-emerald-600"}`}>
+                      {Math.round(data.topology_a.per_agent.reduce((mx, a) => Math.max(mx, a.safety_score ?? 0), 0))}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 text-center"><span className="text-[10px] bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full font-bold">✓ Safety-verified</span></td>
+                </tr>
+                {/* AgentVerse agents */}
+                {asiAgents.map((a) => (
+                  <tr key={a.address}>
+                    <td className="px-5 py-3 text-xs">
+                      <div className="font-semibold text-blue-900">{a.name}</div>
+                      <div className="text-[10px] text-blue-400 font-mono">{a.address}</div>
+                    </td>
+                    <td className="px-4 py-3 text-center"><span className="text-[10px] bg-blue-100 text-blue-700 border border-blue-200 px-2 py-0.5 rounded-full font-bold">AgentVerse</span></td>
+                    <td className="px-4 py-3 text-center text-xs font-mono text-blue-800">{a.total_interactions.toLocaleString()}</td>
+                    <td className="px-4 py-3 text-center">
+                      {a.rating != null ? (
+                        <span className="flex items-center justify-center gap-0.5 text-xs font-bold text-amber-600">
+                          <Star size={11} className="fill-amber-400 text-amber-400" />{a.rating.toFixed(1)}
+                        </span>
+                      ) : <span className="text-xs text-blue-300">—</span>}
+                    </td>
+                    <td className="px-4 py-3 text-center text-xs text-blue-400 italic">not scored</td>
+                    <td className="px-4 py-3 text-center"><span className="text-[10px] bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-bold">Unverified</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="bg-blue-50 border-t border-blue-100 px-5 py-2">
+              <p className="text-[11px] text-blue-500">
+                AgentVerse agents have community trust signals (interactions, rating) but no constitutional safety scoring.
+                SafeAgent's gate verified misalignment score before execution.
+              </p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

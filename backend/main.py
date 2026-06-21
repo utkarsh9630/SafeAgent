@@ -239,10 +239,10 @@ def export_code(session_id: str):
 
 # ── Proof Panel ───────────────────────────────────────────────────────────────
 
-GATE_BASE = os.getenv("SAFETY_GATE_URL", "http://localhost:8000/gate/check").replace("/gate/check", "")
+GATE_BASE = os.getenv("SAFETY_GATE_URL", "http://localhost:8001/gate/check").replace("/gate/check", "")
 
 @app.get("/proof/{session_id}")
-async def proof_session(session_id: str, predicted_cost_usd: float = 0.09):
+async def proof_session(session_id: str, predicted_cost_usd: float = 0.0):
     """
     Merges Arize trace data (session_tracer) with Evan's Redis cache stats.
     Called by Utkarsh's frontend ProofPanel.

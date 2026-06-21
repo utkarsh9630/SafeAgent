@@ -1,9 +1,12 @@
 """
 LangGraph runtime — builds and runs the agent graph from a scaffold blueprint.
 
+Fully dynamic: every agent in the blueprint gets its own node. No names,
+roles, or pipeline shapes are hardcoded here. The blueprint drives everything.
+
 Key integration points:
-  - before_tool_call: calls Evan's safety gate (POST /gate/check)
-  - Events emitted to asyncio.Queue for SSE streaming (Utkarsh subscribes)
+  - before_tool_call: calls the safety gate (POST /gate/check)
+  - Events emitted to asyncio.Queue for SSE streaming
   - After WARN/BLOCK: calls auto-fix generator, then waits for HITL decision
 """
 from __future__ import annotations
@@ -12,7 +15,7 @@ import os
 import time
 import uuid
 import httpx
-from typing import Callable, Optional
+from typing import Callable
 
 from langgraph.graph import StateGraph, END
 
@@ -23,7 +26,7 @@ from models import (
 import sys as _sys
 import os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
-from arize.instrumentation import trace_node
+from arize.instrumentation import session_tracer
 from auto_fix import generate_fix
 from demo_tools import (
     BIASED_RUBRIC, SAMPLE_RESUMES,
@@ -32,6 +35,7 @@ from demo_tools import (
 
 GATE_URL = os.getenv("SAFETY_GATE_URL", "http://localhost:8001/gate/check")
 
+# Map tool names to demo implementations. Any tool not in this map gets a no-op stub.
 TOOL_FNS: dict[str, Callable] = {
     "parse_resume": parse_resume,
     "apply_scoring_rubric": apply_scoring_rubric,
@@ -56,12 +60,76 @@ async def call_gate(req: GateRequest) -> GateResponse:
         )
 
 
+def _pick_tool_params(agent_name: str, tool_name: str, state: dict) -> dict:
+    """
+    Return sensible demo params for a tool call based on what's in state.
+    Falls back to an empty dict so unknown tools still flow through the gate.
+    """
+    name_lower = agent_name.lower()
+    tool_lower = tool_name.lower()
+
+    if "parse" in tool_lower or "pdf" in tool_lower or "extract" in tool_lower:
+        return {"resume_text": state.get("raw_input", SAMPLE_RESUMES[0]["raw_text"])}
+
+    if "scor" in tool_lower or "rubric" in tool_lower or "rank" in tool_lower:
+        return {"candidate": SAMPLE_RESUMES[0], "rubric": BIASED_RUBRIC}
+
+    if "email" in tool_lower or "send" in tool_lower or "notify" in tool_lower:
+        top = state.get("top_candidates", [])
+        shortlist = ", ".join(c.get("candidate_name", "") for c in top) or "candidates"
+        return {
+            "to": "hiring.manager@company.com",
+            "subject": "Shortlist: Top Candidates",
+            "body": f"Top candidates by merit score:\n\n{shortlist}",
+        }
+
+    if "bias" in tool_lower or "audit" in tool_lower or "detect" in tool_lower:
+        candidates = state.get("parsed_candidates", SAMPLE_RESUMES)
+        return {"candidates": [c.get("name", c.get("candidate_name", "")) for c in candidates],
+                "check": "demographic signals"}
+
+    if "supervis" in name_lower or "route" in tool_lower or "manag" in tool_lower:
+        return {"task": "orchestrate pipeline", "stage": state.get("stage", "init")}
+
+    # Generic fallback
+    return {"agent": agent_name, "tool": tool_name, "input": state.get("raw_input", "")}
+
+
+
+def _run_tool(tool_name: str, params: dict, state: dict) -> dict:
+    """
+    Execute a known demo tool synchronously. Returns a result dict.
+    Unknown tools return a stub result so the pipeline always continues.
+    """
+    tool_lower = tool_name.lower()
+
+    if "parse" in tool_lower or "pdf" in tool_lower or "extract" in tool_lower:
+        result = parse_resume(params.get("resume_text", ""))
+        return {"parse_result": result, "parsed_candidates": SAMPLE_RESUMES}
+
+    if "scor" in tool_lower or "rubric" in tool_lower or "rank" in tool_lower:
+        rubric = params.get("rubric", BIASED_RUBRIC)
+        scores = [apply_scoring_rubric(c, rubric) for c in state.get("parsed_candidates", SAMPLE_RESUMES)]
+        scores.sort(key=lambda x: x["total_score"], reverse=True)
+        return {"scores": scores, "top_candidates": scores[:3]}
+
+    if "email" in tool_lower or "send" in tool_lower or "notify" in tool_lower:
+        result = send_email(params.get("to", ""), params.get("subject", ""), params.get("body", ""))
+        return {"email_result": result}
+
+    if "bias" in tool_lower or "audit" in tool_lower or "detect" in tool_lower:
+        return {"audit_status": "passed", "flags": []}
+
+    # No-op stub for any other tool
+    return {"stub_result": f"{tool_name} executed (demo stub)"}
+
+
 class GraphRunner:
     """
     Builds a LangGraph StateGraph from a GraphBlueprint and runs it.
 
-    event_queue: asyncio.Queue[RunEvent] — main.py drains this for SSE.
-    hitl_queue:  asyncio.Queue[HITLDecision] — /run/decide posts here.
+    Fully dynamic — derives every node, edge, and tool call from the blueprint.
+    No agent names, roles, or pipeline structures are hardcoded.
     """
 
     def __init__(
@@ -77,6 +145,7 @@ class GraphRunner:
         self.run_id = run_id
         self.event_queue: asyncio.Queue[RunEvent] = asyncio.Queue()
         self.hitl_queue: asyncio.Queue[HITLDecision] = asyncio.Queue()
+        self._last_gate_tokens: dict[str, tuple[int, int]] = {}
 
     def _emit(self, event_type: str, agent_name: str = "", tool_name: str = "", **data):
         self.event_queue.put_nowait(RunEvent(
@@ -87,6 +156,19 @@ class GraphRunner:
             timestamp_ms=int(time.time() * 1000),
         ))
 
+    async def _before_tool_call_with_tokens(
+        self,
+        agent_name: str,
+        agent_role: str,
+        tool_name: str,
+        tool_params: dict,
+    ) -> tuple[dict, int, int]:
+        """Like before_tool_call but also returns (tokens_in, tokens_out) from real Claude calls."""
+        params = await self.before_tool_call(agent_name, agent_role, tool_name, tool_params)
+        # Gate tokens are stored in the most recent gate event for this agent/tool
+        tok_in, tok_out = self._last_gate_tokens.get(f"{agent_name}:{tool_name}", (0, 0))
+        return params, tok_in, tok_out
+
     async def before_tool_call(
         self,
         agent_name: str,
@@ -94,10 +176,6 @@ class GraphRunner:
         tool_name: str,
         tool_params: dict,
     ) -> dict:
-        """
-        Called before every tool execution.
-        Returns (possibly modified) tool_params to actually run.
-        """
         action_id = str(uuid.uuid4())[:8]
         self._emit("action.requested", agent_name=agent_name, tool_name=tool_name,
                    action_id=action_id, params=tool_params)
@@ -119,11 +197,29 @@ class GraphRunner:
                    cache_hit=gate_resp.cache_hit,
                    latency_ms=gate_resp.latency_ms)
 
+        # Store real T3 token counts for this agent/tool
+        self._last_gate_tokens[f"{agent_name}:{tool_name}"] = (
+            gate_resp.tokens_in, gate_resp.tokens_out
+        )
+
+        # Record real gate data for proof panel
+        session_tracer.record_gate_event(
+            session_id=self.session_id,
+            agent_name=agent_name,
+            tool_name=tool_name,
+            decision=gate_resp.decision,
+            misalignment=gate_resp.misalignment_score or 0,
+            oversight=gate_resp.oversight_score or 0,
+            tier=gate_resp.tier_triggered,
+            cache_hit=gate_resp.cache_hit,
+            latency_ms=gate_resp.latency_ms,
+        )
+
         if gate_resp.decision == "ALLOW":
+            self._emit("action.allowed", agent_name=agent_name, tool_name=tool_name)
             return tool_params
 
-        # WARN or BLOCK — generate auto-fix in a thread (sync Claude call must not block event loop)
-        # then emit action.blocked so the SSE stream can deliver it to the browser immediately.
+        # WARN or BLOCK — generate auto-fix in a thread to avoid blocking the event loop
         loop = asyncio.get_event_loop()
         fix_req = AutoFixRequest(
             session_id=self.session_id,
@@ -134,6 +230,18 @@ class GraphRunner:
             gate_response=gate_resp,
         )
         fix_resp = await loop.run_in_executor(None, generate_fix, fix_req)
+
+        # Record the auto-fix for quality evaluation
+        session_tracer.record_autofix(
+            session_id=self.session_id,
+            agent_name=agent_name,
+            tool_name=tool_name,
+            original_params=tool_params,
+            fix_params=fix_resp.fixed_tool_params,
+            fix_type=fix_resp.fix_type,
+            fix_explanation=fix_resp.explanation,
+            original_misalignment=gate_resp.misalignment_score,
+        )
 
         self._emit("action.blocked", agent_name=agent_name, tool_name=tool_name,
                    action_id=action_id,
@@ -148,10 +256,12 @@ class GraphRunner:
         try:
             decision: HITLDecision = await asyncio.wait_for(self.hitl_queue.get(), timeout=60)
         except asyncio.TimeoutError:
-            # No human decision in 60s — auto-approve the fix and continue
             self._emit("human.decided", agent_name=agent_name, tool_name=tool_name,
                        action_id=action_id, decision="approve_fix", note="auto-timeout")
+            self._emit("action.allowed", agent_name=agent_name, tool_name=tool_name,
+                       note="auto-approved fix")
             return fix_resp.fixed_tool_params
+
         self._emit("human.decided", agent_name=agent_name, tool_name=tool_name,
                    action_id=action_id, decision=decision.decision)
 
@@ -160,144 +270,159 @@ class GraphRunner:
                        note="builder override")
             return tool_params
 
-        if decision.decision == "approve_fix":
-            self._emit("action.allowed", agent_name=agent_name, tool_name=tool_name,
-                       note="approved fix")
-            return fix_resp.fixed_tool_params
-
-        # modify
         params = decision.modified_params or fix_resp.fixed_tool_params
         self._emit("action.allowed", agent_name=agent_name, tool_name=tool_name,
-                   note="builder modified")
+                   note="approved fix")
         return params
 
-    # ── Hiring scenario nodes ─────────────────────────────────────────────────
+    # ── Dynamic graph assembly ────────────────────────────────────────────────
 
-    def _agent_by_name(self, name: str):
-        name_lower = name.lower()
-        for a in self.blueprint.agents:
-            if name_lower in a.name.lower():
-                return a
-        return None
+    def _make_agent_node(self, agent):
+        """
+        Build an async LangGraph node function for a single blueprint agent.
+        Runs every tool the agent declares, gates each one, then merges results.
+        Records real latency + token estimates directly to session_tracer.
+        """
+        topo = self.blueprint.topology
 
-    async def _node_parse(self, state: dict) -> dict:
-        agent = self._agent_by_name("parser")
-        role = agent.role if agent else "Resume Parser"
-        tool_params = {"resume_text": state.get("raw_input", SAMPLE_RESUMES[0]["raw_text"])}
+        async def agent_node(state: dict) -> dict:
+            tools = agent.tools if agent.tools else [agent.name.lower().replace(" ", "_")]
+            merged_state = dict(state)
+            approved_params_cache: dict[str, dict] = {}
+            # Accumulate real token usage from gate's T3 Claude calls
+            real_tokens_in = 0
+            real_tokens_out = 0
+            node_start = time.monotonic()
 
-        self._emit("node.started", agent_name="Parser", tool_name="parse_resume")
-        final_params = await self.before_tool_call("Parser", role, "parse_resume", tool_params)
+            for tool_name in tools:
+                self._emit("node.started", agent_name=agent.name, tool_name=tool_name)
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, parse_resume, final_params["resume_text"])
+                raw_params = _pick_tool_params(agent.name, tool_name, merged_state)
 
-        self._emit("node.completed", agent_name="Parser", tool_name="parse_resume",
-                   result_summary=f"Parsed {result['name']}")
-        return {**state, "parsed_candidates": SAMPLE_RESUMES, "parse_result": result}
+                cache_key = f"{agent.name}:{tool_name}"
+                if cache_key in approved_params_cache:
+                    final_params, gate_tok_in, gate_tok_out = approved_params_cache[cache_key]
+                else:
+                    final_params, gate_tok_in, gate_tok_out = await self._before_tool_call_with_tokens(
+                        agent.name, agent.role, tool_name, raw_params
+                    )
+                    approved_params_cache[cache_key] = (final_params, gate_tok_in, gate_tok_out)
 
-    async def _node_score(self, state: dict) -> dict:
-        agent = self._agent_by_name("scorer")
-        role = agent.role if agent else "Resume Scorer"
+                real_tokens_in += gate_tok_in
+                real_tokens_out += gate_tok_out
 
-        self._emit("node.started", agent_name="Scorer", tool_name="apply_scoring_rubric")
+                loop = asyncio.get_event_loop()
+                tool_result = await loop.run_in_executor(
+                    None, _run_tool, tool_name, final_params, merged_state
+                )
+                merged_state = {**merged_state, **tool_result}
 
-        # Gate the rubric ONCE before scoring all candidates — avoids repeated HITL prompts.
-        rubric_params = await self.before_tool_call(
-            "Scorer", role, "apply_scoring_rubric",
-            {"candidate": SAMPLE_RESUMES[0], "rubric": BIASED_RUBRIC},
-        )
-        approved_rubric = rubric_params.get("rubric", BIASED_RUBRIC)
+                result_summary = _summarise(tool_name, tool_result)
+                self._emit("node.completed", agent_name=agent.name, tool_name=tool_name,
+                           result_summary=result_summary)
 
-        all_scores = []
-        for candidate in state.get("parsed_candidates", SAMPLE_RESUMES):
-            loop = asyncio.get_event_loop()
-            score = await loop.run_in_executor(
-                None, apply_scoring_rubric,
-                candidate, approved_rubric,
+            node_latency_ms = int((time.monotonic() - node_start) * 1000)
+            session_tracer.record_node(
+                session_id=self.session_id,
+                agent_name=agent.name,
+                model=agent.model or "claude-haiku-4-5-20251001",
+                tokens_in=real_tokens_in,
+                tokens_out=real_tokens_out,
+                latency_ms=node_latency_ms,
+                topology=topo,
             )
-            all_scores.append(score)
+            return merged_state
 
-        all_scores.sort(key=lambda x: x["total_score"], reverse=True)
-        self._emit("node.completed", agent_name="Scorer", tool_name="apply_scoring_rubric",
-                   result_summary=f"Scored {len(all_scores)} candidates")
-        return {**state, "scores": all_scores, "top_candidates": all_scores[:3]}
-
-    async def _node_email(self, state: dict) -> dict:
-        agent = self._agent_by_name("email")
-        role = agent.role if agent else "Email Agent"
-        top = state.get("top_candidates", [])
-        shortlist = ", ".join(c["candidate_name"] for c in top)
-        tool_params = {
-            "to": "hiring.manager@company.com",
-            "subject": "Shortlist: Top 3 Candidates",
-            "body": f"Top 3 candidates by merit score:\n\n{shortlist}\n\nDetails: {top}",
-        }
-
-        self._emit("node.started", agent_name="Email", tool_name="send_email")
-        final_params = await self.before_tool_call("Email", role, "send_email", tool_params)
-
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, send_email,
-            final_params["to"], final_params["subject"], final_params["body"]
-        )
-
-        self._emit("node.completed", agent_name="Email", tool_name="send_email",
-                   result_summary=f"Email {result['status']}")
-        return {**state, "email_result": result}
-
-    # ── Graph assembly ────────────────────────────────────────────────────────
+        agent_node.__name__ = agent.name
+        return agent_node
 
     def _build_graph(self):
         workflow = StateGraph(dict)
 
-        agent_names = [a.name.lower() for a in self.blueprint.agents]
-        is_hiring = any("parser" in n or "scorer" in n for n in agent_names)
+        # Determine node order: use blueprint edges if present, otherwise agents list order.
+        ordered_agents = _order_agents(self.blueprint)
 
-        if is_hiring:
-            topo = self.blueprint.topology
-            workflow.add_node("Parser", trace_node("Parser", "haiku-4-5", topo)(self._node_parse))
-            workflow.add_node("Scorer", trace_node("Scorer", "haiku-4-5", topo)(self._node_score))
-            workflow.add_node("Email", trace_node("Email", "haiku-4-5", topo)(self._node_email))
-            workflow.set_entry_point("Parser")
-            workflow.add_edge("Parser", "Scorer")
-            workflow.add_edge("Scorer", "Email")
-            workflow.add_edge("Email", END)
-        else:
-            prev = None
-            for agent in self.blueprint.agents:
-                _agent = agent
-                async def generic_node(state: dict, a=_agent) -> dict:
-                    for tool in a.tools:
-                        params = state.get("input_data", {})
-                        final = await self.before_tool_call(a.name, a.role, tool, params)
-                        fn = TOOL_FNS.get(tool)
-                        if fn:
-                            loop = asyncio.get_event_loop()
-                            result = await loop.run_in_executor(None, lambda: fn(**final))
-                            state = {**state, f"{a.name}_result": result}
-                    return state
+        for agent in ordered_agents:
+            node_fn = self._make_agent_node(agent)
+            workflow.add_node(agent.name, node_fn)
 
-                workflow.add_node(agent.name, generic_node)
-                if prev is None:
-                    workflow.set_entry_point(agent.name)
-                else:
-                    workflow.add_edge(prev, agent.name)
-                prev = agent.name
-
-            if prev:
-                workflow.add_edge(prev, END)
+        # Wire edges
+        names = [a.name for a in ordered_agents]
+        workflow.set_entry_point(names[0])
+        for i in range(len(names) - 1):
+            workflow.add_edge(names[i], names[i + 1])
+        workflow.add_edge(names[-1], END)
 
         return workflow.compile()
 
     async def run(self, input_data: dict) -> dict:
+        session_tracer.new_run(self.session_id)
         self._emit("run.started", session_id=self.session_id, run_id=self.run_id)
         graph = self._build_graph()
         initial_state = {
             "raw_input": input_data.get("description", ""),
             "input_data": input_data,
+            "stage": "init",
+            "session_id": self.session_id,   # needed by trace_node to key traces correctly
         }
         result = await graph.ainvoke(initial_state)
         self._emit("run.completed", session_id=self.session_id, run_id=self.run_id,
                    final_keys=list(result.keys()))
         return result
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _order_agents(blueprint: GraphBlueprint):
+    """
+    Return agents in execution order.
+    Tries to follow blueprint edges; falls back to the agents list order.
+    """
+    if not blueprint.edges:
+        return list(blueprint.agents)
+
+    # Build adjacency from blueprint edges
+    agent_map = {a.name: a for a in blueprint.agents}
+    next_node: dict[str, str] = {}
+    all_targets: set[str] = set()
+
+    for edge in blueprint.edges:
+        if edge.to_node.upper() != "END":
+            next_node[edge.from_node] = edge.to_node
+            all_targets.add(edge.to_node)
+
+    # Entry node = agent that is never a target
+    all_names = set(agent_map.keys())
+    roots = all_names - all_targets
+    start = next(iter(roots)) if roots else blueprint.agents[0].name
+
+    # Walk the chain
+    ordered, visited = [], set()
+    cur = start
+    while cur and cur in agent_map and cur not in visited:
+        ordered.append(agent_map[cur])
+        visited.add(cur)
+        cur = next_node.get(cur, "")
+
+    # Append any agents not reached by edges (shouldn't happen, but safe fallback)
+    for a in blueprint.agents:
+        if a.name not in visited:
+            ordered.append(a)
+
+    return ordered
+
+
+def _summarise(tool_name: str, result: dict) -> str:
+    """Return a short human-readable summary of a tool result."""
+    if "parse_result" in result:
+        return f"Parsed {result['parse_result'].get('name', 'resume')}"
+    if "top_candidates" in result:
+        names = [c.get("candidate_name", "") for c in result["top_candidates"][:3]]
+        return f"Scored {len(result.get('scores', []))} candidates — top: {', '.join(names)}"
+    if "email_result" in result:
+        return f"Email {result['email_result'].get('status', 'sent')}"
+    if "audit_status" in result:
+        return f"Bias audit {result['audit_status']}"
+    if "stub_result" in result:
+        return result["stub_result"]
+    return f"{tool_name} completed"

@@ -106,10 +106,10 @@ export const api = {
   discoverAgents: (domain: string, description: string) =>
     post<{ agents: unknown[]; source: string; query: string }>("/asi/discover", { domain, description }),
 
-  // Proof + audit are from Arize/Redis (Evan) — no backend endpoint yet
-  // Frontend computes proof from collected SSE events until Evan's /proof endpoint ships
-  proof: (_session_id: string) =>
-    get<ProofData>(`/proof/${_session_id}`).catch(() => MOCK.proof()),
+  proof: (session_id: string, predicted_cost_usd?: number) => {
+    const qs = predicted_cost_usd != null ? `?predicted_cost_usd=${predicted_cost_usd}` : "";
+    return get<ProofData>(`/proof/${session_id}${qs}`);
+  },
 
   audit: (session_id: string) =>
     get<{ events: AuditEvent[] }>(`/audit/${session_id}`).catch(() => ({

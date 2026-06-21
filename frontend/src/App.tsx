@@ -176,12 +176,34 @@ export default function App() {
     }, []),
 
     onRunComplete: useCallback(async () => {
-      const p = USE_MOCK
-        ? MOCK.proof()
-        : await api.proof(SESSION_ID);
-      setProof(p);
+      if (USE_MOCK) {
+        setProof(MOCK.proof());
+        setScreen("proof");
+        return;
+      }
+      const predictedCost = blueprint?.prediction?.cost_usd ?? 0;
+      const emptyProof: ProofData = {
+        predicted_cost_usd: predictedCost,
+        topology_a: { actual_cost_usd: 0, actual_latency_ms: 0, per_agent: [] },
+        topology_b: { actual_cost_usd: 0, actual_latency_ms: 0, per_agent: [] },
+        safety_drift: [],
+        redis_cache_hits: 0,
+        redis_total_calls: 0,
+        tokens_saved: 0,
+        autofix_eval_score: 0,
+        hallucination_score: 0,
+        prior_flags_on_pattern: 0,
+        ab_winner: "A",
+      };
+      try {
+        const p = await api.proof(SESSION_ID, predictedCost);
+        setProof(p);
+      } catch (err) {
+        console.error("Proof fetch failed:", err);
+        setProof(emptyProof);
+      }
       setScreen("proof");
-    }, []),
+    }, [blueprint]),
 
     onError: useCallback((msg: string) => {
       console.error("Run error:", msg);

@@ -105,6 +105,8 @@ class GateResponse(BaseModel):
     fix_draft: Optional[str] = None
     cache_hit: bool
     latency_ms: int
+    tokens_in: int = 0    # real tokens from T3 Claude call
+    tokens_out: int = 0   # real tokens from T3 Claude call
 
 
 # ── Auto-Fix ──────────────────────────────────────────────────────────────────

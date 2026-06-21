@@ -167,10 +167,14 @@ async def t3_claude_score(inp: GateInput) -> dict:
     )
     raw = msg.content[0].text.strip()
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
     except json.JSONDecodeError:
         clean = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
+        result = json.loads(clean)
+    # Attach real token usage so the proof panel can show actual Claude API costs
+    result["__tokens_in__"] = msg.usage.input_tokens
+    result["__tokens_out__"] = msg.usage.output_tokens
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +264,8 @@ async def gate_check(inp: GateInput) -> GateOutput:
         fix_draft=fix,
         cache_hit=False,
         latency_ms=int((time.perf_counter() - t_start) * 1000),
+        tokens_in=scored.get("__tokens_in__", 0),
+        tokens_out=scored.get("__tokens_out__", 0),
     )
 
     await t2_cache_store(inp, result)

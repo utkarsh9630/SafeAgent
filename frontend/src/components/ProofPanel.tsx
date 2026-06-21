@@ -65,7 +65,7 @@ interface Props {
   blueprint?: GraphBlueprint;
 }
 
-export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [], generatedCode, sessionId }: Props) {
+export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [], generatedCode, sessionId, blueprint }: Props) {
   const variance =
     ((data.topology_a.actual_cost_usd - data.predicted_cost_usd) /
       data.predicted_cost_usd) *
@@ -109,14 +109,18 @@ export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [], g
     URL.revokeObjectURL(url);
   }
 
+  // Use blueprint topology names if available, fall back to generic labels
+  const topoAName = blueprint?.topology === "A" ? (blueprint?.topology_name ?? "Topology A") : "Topology A";
+  const topoBName = blueprint?.topology === "B" ? (blueprint?.topology_name ?? "Topology B") : "Topology B";
+
   const topologyCompare = [
     {
-      name: "Supervisor-Worker",
+      name: topoAName,
       cost: +(data.topology_a.actual_cost_usd * 100).toFixed(1),
       latency: +(data.topology_a.actual_latency_ms / 1000).toFixed(1),
     },
     {
-      name: "ReAct",
+      name: topoBName,
       cost: +(data.topology_b.actual_cost_usd * 100).toFixed(1),
       latency: +(data.topology_b.actual_latency_ms / 1000).toFixed(1),
     },
@@ -209,7 +213,9 @@ export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [], g
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
           {/* Safety drift */}
           <div className="bg-white border-2 border-emerald-200 rounded-2xl p-5 shadow-sm">
-            <div className="text-sm font-bold text-emerald-900 mb-4">Safety Score Drift (3 runs)</div>
+            <div className="text-sm font-bold text-emerald-900 mb-4">
+              Safety Score Drift ({data.safety_drift.length} {data.safety_drift.length === 1 ? "run" : "runs"})
+            </div>
             <ResponsiveContainer width="100%" height={200}>
               <LineChart data={data.safety_drift}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#d1fae5" />
@@ -222,7 +228,11 @@ export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [], g
               </LineChart>
             </ResponsiveContainer>
             <p className="text-xs text-emerald-500 mt-2">
-              Run 1: raw flag · Run 2: post-fix · Run 3: cached result
+              {data.safety_drift.length === 0
+                ? "No gate events recorded."
+                : data.safety_drift.map((r) =>
+                    `Run ${r.run}: misalignment ${r.misalignment}, oversight ${r.oversight}`
+                  ).join(" · ")}
             </p>
           </div>
 
@@ -307,8 +317,9 @@ export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [], g
               {Math.round(data.autofix_eval_score * 100)}%
             </div>
             <p className="text-xs text-emerald-500 leading-relaxed">
-              Did the safer rubric actually address the flagged misalignment?
-              Claude-as-judge evaluated the fix against the original complaint.
+              {data.autofix_eval_score === 0
+                ? "No auto-fix was triggered this run — no flag was raised."
+                : `Fix scored ${Math.round(data.autofix_eval_score * 100)}% — measured by how much the dominant biased parameter shrank after the auto-fix.`}
             </p>
             <div className="mt-3 w-full bg-emerald-100 rounded-full h-2">
               <div
@@ -329,8 +340,11 @@ export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [], g
               {Math.round(data.hallucination_score * 100)}%
             </div>
             <p className="text-xs text-emerald-500 leading-relaxed">
-              Auto-fix is {Math.round(data.hallucination_score * 100)}% grounded —
-              it did not invent criteria absent from the job description.
+              {data.hallucination_score === 1
+                ? "Fix is fully grounded — no new criteria were invented outside the original parameters."
+                : data.hallucination_score === 0
+                ? "No auto-fix was evaluated this run."
+                : `Fix is ${Math.round(data.hallucination_score * 100)}% grounded — some parameters may have shifted outside the original schema.`}
             </p>
             <div className="mt-3 w-full bg-emerald-100 rounded-full h-2">
               <div
@@ -356,14 +370,38 @@ export function ProofPanel({ data, onExport, auditEvents = [], asiAgents = [], g
                 ? " First time this rubric was seen."
                 : ` Pattern has been flagged before — gate score pre-loaded from cache.`}
             </p>
-            <div className="text-xs text-emerald-700 font-semibold">
-              A/B Winner:{" "}
-              <span className="text-emerald-600">
-                {data.ab_winner === "B"
-                  ? "ReAct (−36% cost)"
-                  : "Supervisor-Worker (cleaner audit trail)"}
-              </span>
-            </div>
+            {(() => {
+              const winnerName = data.ab_winner === "A" ? topoAName : topoBName;
+              const costA = data.topology_a.actual_cost_usd;
+              const costB = data.topology_b.actual_cost_usd;
+              const latA  = data.topology_a.actual_latency_ms;
+              const latB  = data.topology_b.actual_latency_ms;
+              let reason = "";
+              if (costA > 0 && costB > 0) {
+                const diff = Math.abs(costA - costB);
+                const pct  = Math.round((diff / Math.max(costA, costB)) * 100);
+                if (pct > 1) {
+                  reason = data.ab_winner === "A"
+                    ? `−${pct}% cost vs ${topoBName}`
+                    : `−${pct}% cost vs ${topoAName}`;
+                } else if (latA !== latB) {
+                  const latDiff = Math.abs(latA - latB);
+                  const latPct = Math.round((latDiff / Math.max(latA, latB)) * 100);
+                  reason = data.ab_winner === "A"
+                    ? `−${latPct}% latency vs ${topoBName}`
+                    : `−${latPct}% latency vs ${topoAName}`;
+                } else {
+                  reason = "equal cost — first topology selected";
+                }
+              } else {
+                reason = "only one topology ran this session";
+              }
+              return (
+                <div className="text-xs text-emerald-700 font-semibold">
+                  A/B Winner: <span className="text-emerald-600">{winnerName} ({reason})</span>
+                </div>
+              );
+            })()}
           </div>
         </div>
 

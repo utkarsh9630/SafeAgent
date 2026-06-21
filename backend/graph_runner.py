@@ -31,7 +31,7 @@ from demo_tools import (
     apply_scoring_rubric, parse_resume, send_email,
 )
 
-GATE_URL = os.getenv("SAFETY_GATE_URL", "http://localhost:8001/gate/check")
+GATE_URL = os.getenv("SAFETY_GATE_URL", "http://localhost:8000/gate/check")
 
 # Map tool names to demo implementations. Any tool not in this map gets a no-op stub.
 TOOL_FNS: dict[str, Callable] = {
